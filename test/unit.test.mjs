@@ -1,0 +1,378 @@
+// Offline tests: node test/unit.test.mjs
+//  - HEX parsing + custom-defaults insertion match rotorflight-configurator byte for byte
+//    (set CONFIGURATOR_DIR to a rotorflight-configurator checkout to enable)
+//  - DFU flasher against a simulated STM32 DfuSe bootloader
+//  - AM32 ESC programming against a simulated Rotorflight 4-way bridge
+//  - CLI script preparation
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { parseHex, insertConfig, buildCustomDefaults } from "../site/js/hex.js";
+import { DfuDevice, parseFlashDescriptor } from "../site/js/dfu.js";
+import { MspClient, MSP } from "../site/js/msp.js";
+import { EscProgrammer, buildWritePayload, summarizeSettings } from "../site/js/esc.js";
+import { prepareCliScript } from "../site/js/cli.js";
+import { SETUP } from "../site/js/setup-data.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const site = (p) => path.join(here, "..", "site", p);
+let passed = 0;
+async function test(name, fn) {
+  try {
+    await fn();
+    passed++;
+    console.log(`ok   ${name}`);
+  } catch (err) {
+    console.log(`FAIL ${name}\n     ${err.stack}`);
+    process.exitCode = 1;
+  }
+}
+
+const hexText = await readFile(site(SETUP.firmware.hex), "utf8");
+const configText = await readFile(site(SETUP.firmware.targetConfig), "utf8");
+const defaults = buildCustomDefaults(configText, {
+  configName: SETUP.firmware.targetConfigName,
+  boardName: SETUP.board.name,
+  manufacturerId: SETUP.board.manufacturer,
+  commitInfo: SETUP.firmware.targetsCommit,
+});
+
+// ---------------------------------------------------------------------------
+await test("custom defaults string", () => {
+  assert.ok(defaults.startsWith("## Rotorflight Custom Defaults\n"));
+  assert.match(defaults, /^board_name GOOSKY_F4MINI$/m);
+  assert.match(defaults, /^resource MOTOR 1 C08$/m);
+  assert.doesNotMatch(defaults, /\r/);
+});
+
+await test("firmware image builds and has room for the defaults", () => {
+  const hex = insertConfig(parseHex(hexText), defaults);
+  assert.equal(hex.data[0].address, 0x08000000);
+  const last = hex.data[hex.data.length - 1];
+  assert.ok(last.address + last.bytes <= 0x08100000, "fits in 1 MB");
+});
+
+const CONFIGURATOR_DIR = process.env.CONFIGURATOR_DIR;
+if (CONFIGURATOR_DIR && existsSync(CONFIGURATOR_DIR)) {
+  await test("HEX + config identical to rotorflight-configurator", async () => {
+    // hex_parser.js is a worker script: run it with a captured postMessage.
+    const parserSrc = await readFile(path.join(CONFIGURATOR_DIR, "src/js/workers/hex_parser.js"), "utf8");
+    let theirs;
+    const run = new Function("postMessage", "close", "console", parserSrc + "\nreturn read_hex_file;");
+    run((r) => (theirs = r), () => {}, { time() {}, timeEnd() {}, log() {} })(hexText);
+    const { ConfigInserter } = await import(pathToFileURL(path.join(CONFIGURATOR_DIR, "src/js/ConfigInserter.js")));
+    const quiet = { time: console.time, timeEnd: console.timeEnd };
+    console.time = console.timeEnd = () => {};
+    new ConfigInserter().insertConfig(theirs, defaults);
+    Object.assign(console, quiet);
+
+    const ours = insertConfig(parseHex(hexText), defaults);
+    assert.equal(ours.bytes_total, theirs.bytes_total);
+    assert.equal(ours.data.length, theirs.data.length);
+    ours.data.forEach((b, i) => {
+      assert.equal(b.address, theirs.data[i].address);
+      assert.deepEqual(b.data, theirs.data[i].data);
+    });
+  });
+} else {
+  console.log("skip HEX comparison with rotorflight-configurator (set CONFIGURATOR_DIR)");
+}
+
+// ---------------------------------------------------------------------------
+// Simulated STM32 ROM DFU bootloader (DfuSe), F405 layout, 1 MB.
+class FakeDfu {
+  constructor({ transferSize = 2048 } = {}) {
+    this.vendorId = 0x0483;
+    this.productId = 0xdf11;
+    this.opened = false;
+    this.configuration = null;
+    this.layout = "@Internal Flash  /0x08000000/04*016Kg,01*064Kg,07*128Kg";
+    this.parsed = parseFlashDescriptor(this.layout);
+    this.flash = new Uint8Array(this.parsed.totalSize).fill(0x00); // "old firmware"
+    this.transferSize = transferSize;
+    this.state = 2;
+    this.pending = null;
+    this.addr = 0x08000000;
+    this.left = false;
+  }
+  async open() { this.opened = true; }
+  async close() { this.opened = false; }
+  async selectConfiguration() { this.configuration = {}; }
+  async claimInterface() {}
+  async releaseInterface() {}
+  async selectAlternateInterface() {}
+  str(s) {
+    const b = [2 + s.length * 2, 3];
+    for (const c of s) b.push(c.charCodeAt(0), 0);
+    return b;
+  }
+  configDescriptor() {
+    const iface = (alt, iStr) => [9, 4, 0, alt, 0, 0xfe, 1, 2, iStr];
+    const func = [9, 0x21, 0x0b, 0xff, 0x00, this.transferSize & 0xff, this.transferSize >> 8, 0x1a, 0x01];
+    const body = [...iface(0, 4), ...iface(1, 5), ...func];
+    const total = 9 + body.length;
+    return [9, 2, total & 0xff, total >> 8, 1, 1, 0, 0xc0, 50, ...body];
+  }
+  reply(bytes, length) {
+    const u8 = Uint8Array.from(bytes.slice(0, length));
+    return { status: "ok", data: new DataView(u8.buffer) };
+  }
+  async controlTransferIn(setup, length) {
+    if (setup.requestType === "standard") {
+      const type = setup.value >> 8;
+      const index = setup.value & 0xff;
+      if (type === 2) return this.reply(this.configDescriptor(), length);
+      if (type === 3 && index === 0) return this.reply([4, 3, 0x09, 0x04], length);
+      if (type === 3 && index === 4) return this.reply(this.str(this.layout), length);
+      if (type === 3 && index === 5) return this.reply(this.str("@Option Bytes  /0x1FFFC000/01*016 e"), length);
+      return { status: "stall" };
+    }
+    switch (setup.request) {
+      case 3: { // GETSTATUS executes the pending download
+        if (this.pending) {
+          if (this.state !== 4) {
+            this.state = 4; // dfuDNBUSY
+            return this.reply([0, 2, 0, 0, this.state, 0], length);
+          }
+          const ok = this.execute(this.pending);
+          this.pending = null;
+          this.state = ok ? 5 : 10;
+          return this.reply([ok ? 0 : 3, 0, 0, 0, this.state, 0], length);
+        }
+        return this.reply([0, 0, 0, 0, this.state, 0], length);
+      }
+      case 2: { // UPLOAD
+        if (this.state !== 2 && this.state !== 9) throw new Error(`UPLOAD in state ${this.state}`);
+        this.state = 9;
+        const start = this.addr - 0x08000000 + (setup.value - 2) * this.transferSize;
+        return this.reply(Array.from(this.flash.slice(start, start + length)), length);
+      }
+      default:
+        return { status: "stall" };
+    }
+  }
+  async controlTransferOut(setup, data) {
+    const bytes = new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength ?? data.length);
+    switch (setup.request) {
+      case 1: // DNLOAD
+        if (bytes.length === 0) {
+          this.left = true;
+          return { status: "ok" };
+        }
+        this.pending = { block: setup.value, data: Uint8Array.from(bytes) };
+        this.state = 3;
+        return { status: "ok" };
+      case 4: // CLRSTATUS
+      case 6: // ABORT
+        this.state = 2;
+        this.pending = null;
+        return { status: "ok" };
+      default:
+        return { status: "stall" };
+    }
+  }
+  execute({ block, data }) {
+    const le = (d) => (d[1] | (d[2] << 8) | (d[3] << 16) | (d[4] << 24)) >>> 0;
+    if (block === 0) {
+      if (data[0] === 0x21) {
+        this.addr = le(data);
+        return true;
+      }
+      if (data[0] === 0x41) {
+        const a = le(data) - 0x08000000;
+        const sector = this.parsed.sectors.find((s) => a >= s.startAddress - 0x08000000 && a < s.startAddress - 0x08000000 + s.totalSize);
+        const off = sector.startAddress - 0x08000000 + Math.floor((a - (sector.startAddress - 0x08000000)) / sector.pageSize) * sector.pageSize;
+        this.flash.fill(0xff, off, off + sector.pageSize);
+        return true;
+      }
+      return false;
+    }
+    const start = this.addr - 0x08000000 + (block - 2) * this.transferSize;
+    for (let i = 0; i < data.length; i++) this.flash[start + i] &= data[i]; // flash can only clear bits
+    return true;
+  }
+}
+
+await test("DFU: erase, write, verify, leave against a simulated F405 bootloader", async () => {
+  const hex = insertConfig(parseHex(hexText), defaults);
+  const dev = new FakeDfu();
+  const dfu = new DfuDevice(dev);
+  await dfu.open();
+  assert.equal(dfu.memory.totalSize, 1024 * 1024);
+  assert.equal(dfu.transferSize, 2048);
+  const phases = [];
+  await dfu.flash(hex, { onPhase: (p) => phases.push(p) });
+  assert.deepEqual(phases, ["erase", "write", "verify"]);
+  const expected = new Uint8Array(dev.flash.length).fill(0xff);
+  for (const b of hex.data) expected.set(b.data, b.address - 0x08000000);
+  assert.ok(Buffer.from(dev.flash).equals(Buffer.from(expected)), "flash content matches image");
+  await dfu.leave();
+  assert.ok(dev.left, "device told to leave DFU");
+});
+
+await test("DFU: verify catches a bad write", async () => {
+  const hex = insertConfig(parseHex(hexText), defaults);
+  const dev = new FakeDfu();
+  const realExecute = dev.execute.bind(dev);
+  let n = 0;
+  dev.execute = (p) => {
+    if (p.block >= 2 && ++n === 40) p.data[100] ^= 0xff; // corrupt one chunk
+    return realExecute(p);
+  };
+  const dfu = new DfuDevice(dev);
+  await dfu.open();
+  await assert.rejects(dfu.flash(hex), /Verification failed/);
+});
+
+// ---------------------------------------------------------------------------
+// Simulated Rotorflight FC with two AM32 ESCs behind the 4-way bridge
+// (behaviour of sensors/esc_sensor.c at 2a0a8d1).
+function fakeFc(escs) {
+  const dataListeners = new Set();
+  const st = { selected: 100, programming: false, readsSinceSelect: 0, pending: null, writes: 0 };
+  const send = (code, payload, error = false) => {
+    const size = payload.length;
+    const frame = [0x24, 0x4d, error ? 0x21 : 0x3e, size, code, ...payload];
+    let ck = size ^ code;
+    for (const b of payload) ck ^= b;
+    frame.push(ck);
+    setTimeout(() => dataListeners.forEach((fn) => fn(Uint8Array.from(frame))), 1);
+  };
+  const flush = () => {
+    if (st.pending) {
+      escs[st.pending.id].set(st.pending.data);
+      st.writes++;
+      st.pending = null;
+    }
+  };
+  const handle = (code, payload) => {
+    switch (code) {
+      case MSP.SET_4WIF_ESC_FWD_PROG: {
+        flush();
+        const id = payload[0];
+        if (id >= 4) {
+          st.selected = 100;
+          st.programming = false;
+        } else {
+          st.selected = id;
+          st.programming = true;
+          st.readsSinceSelect = 0;
+        }
+        return send(code, []);
+      }
+      case MSP.ESC_PARAMETERS: {
+        if (st.selected >= 4) return send(code, [], true);
+        if (st.readsSinceSelect++ === 0) return send(code, [], true); // first fetch fails
+        return send(code, [0xc2, 0x00, ...escs[st.selected]]);
+      }
+      case MSP.SET_ESC_PARAMETERS: {
+        if (st.selected >= 4 || payload.length !== 50 || payload[0] !== 0xc2 || payload[1] !== 0) return send(code, [], true);
+        st.pending = { id: st.selected, data: payload.slice(2) };
+        return send(code, []);
+      }
+      default:
+        return send(code, [], true);
+    }
+  };
+  let buf = [];
+  return {
+    st,
+    transport: {
+      onData(fn) { dataListeners.add(fn); return () => dataListeners.delete(fn); },
+      onClose() { return () => {}; },
+      async write(bytes) {
+        buf.push(...bytes);
+        while (buf.length >= 6) {
+          const size = buf[3];
+          if (buf.length < 6 + size) break;
+          const frame = buf.splice(0, 6 + size);
+          handle(frame[4], frame.slice(5, 5 + size));
+        }
+      },
+      async close() {},
+    },
+  };
+}
+
+const FAST = { preSwitchDelayMs: 1, switchReadDelayMs: 1, pollIntervalMs: 5, detectTimeoutMs: 500, postSaveSettleMs: 1, postSaveReturnMs: 1 };
+const mainFile = new Uint8Array(await readFile(site(SETUP.escs[0].file)));
+const tailFile = new Uint8Array(await readFile(site(SETUP.escs[1].file)));
+
+await test(".ecf files are AM32 EEPROM v3 images", () => {
+  for (const f of [mainFile, tailFile]) {
+    assert.equal(f.length, 48);
+    assert.equal(f[0], 1);
+    assert.equal(f[1], 3);
+  }
+  const main = Object.fromEntries(summarizeSettings(mainFile));
+  assert.equal(main["Motor KV"], 500);
+  assert.equal(main["Motor poles"], 24);
+  assert.equal(main.Timing, "15.0°");
+});
+
+await test("ESC: both ESCs programmed, identity bytes preserved, verified", async () => {
+  // ESCs currently hold other settings and a newer AM32 build (2.20).
+  const esc0 = Uint8Array.from(tailFile); esc0[3] = 2; esc0[4] = 20; esc0[2] = 5;
+  const esc1 = Uint8Array.from(mainFile); esc1[4] = 20;
+  const sim = fakeFc([esc0, esc1, new Uint8Array(48), new Uint8Array(48)]);
+  const msp = new MspClient(sim.transport);
+  const prog = new EscProgrammer(msp, () => {}, FAST);
+  const r0 = await prog.program(0, mainFile);
+  const r1 = await prog.program(1, tailFile);
+  await prog.deselect();
+  assert.ok(r0.changed && r1.changed);
+  assert.equal(sim.st.writes, 2);
+  assert.deepEqual(Array.from(esc0.slice(5)), Array.from(mainFile.slice(5)));
+  assert.deepEqual(Array.from(esc1.slice(5)), Array.from(tailFile.slice(5)));
+  assert.deepEqual(Array.from(esc0.slice(0, 5)), [1, 3, 5, 2, 20], "ESC identity kept");
+  assert.equal(sim.st.selected, 100, "bridge deselected at the end");
+  msp.dispose();
+});
+
+await test("ESC: nothing written when settings already match", async () => {
+  const esc0 = Uint8Array.from(mainFile);
+  const sim = fakeFc([esc0, new Uint8Array(48), new Uint8Array(48), new Uint8Array(48)]);
+  const msp = new MspClient(sim.transport);
+  const r = await new EscProgrammer(msp, () => {}, FAST).program(0, mainFile);
+  assert.equal(r.changed, false);
+  assert.equal(sim.st.writes, 0);
+  msp.dispose();
+});
+
+await test("ESC: refuses a different EEPROM layout", async () => {
+  const esc0 = Uint8Array.from(mainFile); esc0[1] = 2;
+  const sim = fakeFc([esc0, new Uint8Array(48), new Uint8Array(48), new Uint8Array(48)]);
+  const msp = new MspClient(sim.transport);
+  await assert.rejects(new EscProgrammer(msp, () => {}, FAST).program(0, mainFile), /layout v2/);
+  assert.equal(sim.st.writes, 0);
+  msp.dispose();
+});
+
+await test("ESC: write payload is header + file with ESC identity", () => {
+  const current = Uint8Array.from(mainFile); current[4] = 99;
+  const p = buildWritePayload(current, tailFile);
+  assert.equal(p.length, 50);
+  assert.deepEqual(Array.from(p.slice(0, 2)), [0xc2, 0x00]);
+  assert.equal(p[2 + 4], 99);
+  assert.deepEqual(Array.from(p.slice(7)), Array.from(tailFile.slice(5)));
+});
+
+// ---------------------------------------------------------------------------
+await test("CLI script preparation", async () => {
+  const lines = prepareCliScript(await readFile(site(SETUP.cliDump), "utf8"));
+  assert.equal(lines[0], "defaults nosave");
+  assert.equal(lines[1], "batch start");
+  assert.ok(!lines.some((l) => l.startsWith("#") || l === "save" || l.startsWith("mcu_id") || l.startsWith("signature")));
+  assert.ok(lines.includes("board_name GOOSKY_F4MINI"));
+  assert.ok(lines.includes("set name = Bo105_Zi"));
+});
+
+await test("MSP frame encoding", () => {
+  assert.deepEqual(Array.from(MspClient.encode(1)), [0x24, 0x4d, 0x3c, 0, 1, 1]);
+  assert.deepEqual(Array.from(MspClient.encode(244, [1])), [0x24, 0x4d, 0x3c, 1, 244, 1, 1 ^ 244 ^ 1]);
+});
+
+console.log(`\n${passed} passed${process.exitCode ? ", some FAILED" : ""}`);

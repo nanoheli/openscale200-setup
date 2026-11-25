@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenScale 200 Setup · Rotorflight</title>
+  <meta name="description" content="Guided setup for the OpenScale 200 helicopter: AM32 ESC configuration, Rotorflight firmware update and settings.">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="assets/rf-logo.svg" alt="Rotorflight" class="brand-logo">
+      <div class="brand-divider" aria-hidden="true"></div>
+      <div class="brand-title">
+        <span class="brand-model">OpenScale 200</span>
+        <span class="brand-sub">Setup Assistant</span>
+      </div>
+    </div>
+    <div class="connection">
+      <span class="conn-pill" id="conn-pill" data-state="off"><span class="dot"></span><span id="conn-text">Not connected</span></span>
+      <button class="btn btn-ghost btn-sm" id="conn-button" type="button">Connect</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="stepper" aria-label="Setup steps">
+      <ol id="stepper"></ol>
+    </nav>
+
+    <main id="main">
+      <!-- Step: welcome -->
+      <section class="step" data-step="welcome" data-title="Get started">
+        <p class="eyebrow">OpenScale 200 · GOOSKY F4 Mini · AM32</p>
+        <h1>Set up your OpenScale 200</h1>
+        <p class="lead">This assistant prepares the electronics of your helicopter in four steps. It takes about five minutes.</p>
+
+        <ol class="overview">
+          <li><span class="ov-icon">⚡</span><div><strong>Power up</strong><span>Connect the flight battery and USB.</span></div></li>
+          <li><span class="ov-icon">⚙</span><div><strong>Configure the ESCs</strong><span>Main motor (1) and tail motor (2) get their AM32 settings.</span></div></li>
+          <li><span class="ov-icon">⬆</span><div><strong>Update Rotorflight</strong><span>Install Rotorflight <span data-bind="fwVersion"></span> (master <code data-bind="fwCommit"></code>).</span></div></li>
+          <li><span class="ov-icon">✓</span><div><strong>Apply the settings</strong><span>Load the tested OpenScale 200 configuration.</span></div></li>
+        </ol>
+
+        <div class="card">
+          <h3>You will need</h3>
+          <ul class="checklist">
+            <li>A computer with <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong></li>
+            <li>A USB data cable for the flight controller</li>
+            <li>A charged flight battery</li>
+            <li>The main and tail rotor blades <strong>removed</strong></li>
+          </ul>
+        </div>
+
+        <div class="notice notice-error" id="browser-error" hidden>
+          <strong>This browser can't talk to the helicopter.</strong>
+          <span>Open this page in Google Chrome or Microsoft Edge on a desktop computer. Firefox, Safari and mobile browsers don't support USB access.</span>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary btn-lg" id="welcome-start" type="button">Start setup</button>
+        </div>
+      </section>
+
+      <!-- Step: power -->
+      <section class="step" data-step="power" data-title="Power up">
+        <p class="eyebrow">Step 1 of 4</p>
+        <h1>Power the helicopter with the battery</h1>
+        <p class="lead">The ESCs only respond when the flight battery is connected. USB power alone isn't enough.</p>
+
+        <div class="notice notice-warn">
+          <strong>Safety first: remove the main and tail rotor blades.</strong>
+          <span>Motors can twitch while the ESCs are being programmed.</span>
+        </div>
+
+        <ol class="instructions">
+          <li><span class="num">1</span><div><strong>Remove the rotor blades</strong><span>Main and tail blades off, helicopter on a stable surface.</span></div></li>
+          <li><span class="num">2</span><div><strong>Connect USB</strong><span>Plug the USB cable into the flight controller and into this computer.</span></div></li>
+          <li><span class="num">3</span><div><strong>Connect the flight battery</strong><span>Plug in the battery. You should hear the ESC start-up tones.</span></div></li>
+        </ol>
+
+        <label class="confirm">
+          <input type="checkbox" id="power-confirm">
+          <span>The battery is connected and the rotor blades are removed.</span>
+        </label>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="power-next" type="button" disabled>Continue</button>
+        </div>
+      </section>
+
+      <!-- Step: escs -->
+      <section class="step" data-step="escs" data-title="ESCs">
+        <p class="eyebrow">Step 2 of 4</p>
+        <h1>Configure the ESCs</h1>
+        <p class="lead">Both AM32 ESCs are programmed through the flight controller. Keep the battery connected.</p>
+
+        <div class="esc-grid" id="esc-grid"></div>
+
+        <div class="notice notice-info" id="esc-old-fw" hidden>
+          <strong>The firmware on this flight controller is too old to program ESCs.</strong>
+          <span>Update the firmware and apply the settings first. The assistant brings you back here afterwards.</span>
+          <div class="actions-inline"><button class="btn btn-secondary btn-sm" id="esc-defer" type="button">Update firmware first</button></div>
+        </div>
+        <div class="notice notice-error" id="esc-error" hidden></div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="esc-run" type="button">Configure ESCs</button>
+          <button class="btn btn-primary" id="esc-next" type="button" hidden>Continue</button>
+          <button class="btn btn-link" id="esc-skip" type="button">Skip this step</button>
+        </div>
+      </section>
+
+      <!-- Step: firmware -->
+      <section class="step" data-step="firmware" data-title="Firmware">
+        <p class="eyebrow">Step 3 of 4</p>
+        <h1>Update Rotorflight</h1>
+        <p class="lead">Installs Rotorflight <strong data-bind="fwVersion"></strong> from master <a data-bind-href="fwCommitUrl" target="_blank" rel="noopener"><code data-bind="fwCommit"></code></a> for the <strong>GOOSKY F4 Mini</strong> flight controller.</p>
+
+        <div class="card fw-compare">
+          <div><span class="label">Installed</span><span class="value" id="fw-current">Connect to check</span></div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div><span class="label">New</span><span class="value" id="fw-target"></span></div>
+        </div>
+
+        <div class="notice notice-info">
+          <strong>The flight controller is completely erased.</strong>
+          <span>All settings are restored in the next step. The flight controller restarts in bootloader mode and briefly disappears from the computer.</span>
+        </div>
+
+        <div class="progress-block" id="fw-progress" hidden>
+          <div class="phases" id="fw-phases">
+            <span data-phase="prepare">Prepare</span><span data-phase="bootloader">Bootloader</span><span data-phase="erase">Erase</span><span data-phase="write">Write</span><span data-phase="verify">Verify</span><span data-phase="restart">Restart</span>
+          </div>
+          <div class="bar"><div class="bar-fill" id="fw-bar"></div></div>
+          <p class="progress-text" id="fw-status"></p>
+        </div>
+
+        <div class="card dfu-select" id="fw-dfu" hidden>
+          <h3>Select the flight controller in bootloader mode</h3>
+          <p>Your browser will list a device called <strong>STM32 BOOTLOADER</strong> (or "DFU in FS Mode"). Select it and click <em>Connect</em>.</p>
+          <div class="actions-inline"><button class="btn btn-primary" id="fw-dfu-select" type="button">Select bootloader device</button></div>
+          <details class="help">
+            <summary>The device doesn't show up</summary>
+            <ul>
+              <li><strong>Windows:</strong> the bootloader needs the WinUSB driver. Install it once with <a href="https://zadig.akeo.ie/" target="_blank" rel="noopener">Zadig</a> (select "STM32 BOOTLOADER", driver "WinUSB") or the ImpulseRC Driver Fixer, then click the button again.</li>
+              <li><strong>Linux:</strong> add a udev rule for <code>0483:df11</code> so your user can access it.</li>
+              <li>Still nothing? Unplug USB, hold the <strong>BOOT</strong> button on the flight controller, plug USB back in, release the button.</li>
+            </ul>
+          </details>
+        </div>
+
+        <div class="notice notice-error" id="fw-error" hidden></div>
+        <div class="notice notice-ok" id="fw-ok" hidden></div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="fw-run" type="button">Update firmware</button>
+          <button class="btn btn-primary" id="fw-next" type="button" hidden>Continue</button>
+          <button class="btn btn-link" id="fw-dfu-direct" type="button">My flight controller is already in bootloader mode</button>
+          <button class="btn btn-link" id="fw-skip" type="button">Skip this step</button>
+        </div>
+      </section>
+
+      <!-- Step: settings -->
+      <section class="step" data-step="settings" data-title="Settings">
+        <p class="eyebrow">Step 4 of 4</p>
+        <h1>Apply the helicopter settings</h1>
+        <p class="lead">Loads the tested configuration <code data-bind="cliFile"></code>: receiver, swashplate, servos, governor, rates and PID tuning.</p>
+
+        <div class="card stat-row">
+          <div><span class="label">Craft name</span><span class="value" data-bind="craftName"></span></div>
+          <div><span class="label">Commands</span><span class="value" id="cli-count">–</span></div>
+          <div><span class="label">Board</span><span class="value">GOOSKY F4 Mini</span></div>
+        </div>
+
+        <div class="notice notice-warn" id="cli-fw-warn" hidden></div>
+
+        <div class="progress-block" id="cli-progress" hidden>
+          <div class="bar"><div class="bar-fill" id="cli-bar"></div></div>
+          <p class="progress-text" id="cli-status"></p>
+        </div>
+
+        <div class="notice notice-error" id="cli-errors" hidden>
+          <strong>Some settings were not accepted.</strong>
+          <span>Nothing has been saved yet. You can save the settings that were accepted, or discard everything.</span>
+          <pre class="error-list" id="cli-error-list"></pre>
+          <div class="actions-inline">
+            <button class="btn btn-secondary btn-sm" id="cli-save-anyway" type="button">Save anyway</button>
+            <button class="btn btn-ghost btn-sm" id="cli-discard" type="button">Discard changes</button>
+          </div>
+        </div>
+        <div class="notice notice-error" id="cli-error" hidden></div>
+        <div class="notice notice-ok" id="cli-ok" hidden></div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="cli-run" type="button">Apply settings</button>
+          <button class="btn btn-primary" id="cli-next" type="button" hidden>Continue</button>
+          <button class="btn btn-link" id="cli-skip" type="button">Skip this step</button>
+        </div>
+      </section>
+
+      <!-- Step: done -->
+      <section class="step" data-step="done" data-title="Finish">
+        <div class="done-hero">
+          <div class="done-badge" aria-hidden="true">✓</div>
+          <div>
+            <p class="eyebrow">All done</p>
+            <h1 id="done-title">Your OpenScale 200 is set up</h1>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Summary</h3>
+          <ul class="summary" id="done-summary"></ul>
+        </div>
+
+        <div class="card">
+          <h3>Before the first flight</h3>
+          <ol class="plain-list">
+            <li>Unplug the battery.</li>
+            <li>In the <a href="https://rotorflight.org" target="_blank" rel="noopener">Rotorflight Configurator</a>, check that the swashplate and tail servo move in the right direction and that both motors spin the right way (blades still off).</li>
+            <li>Reinstall the main and tail rotor blades.</li>
+          </ol>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-secondary" id="done-log" type="button">Save setup log</button>
+          <button class="btn btn-link" id="done-restart" type="button">Start over</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="logbar" id="logbar">
+    <button class="log-toggle" id="log-toggle" type="button" aria-expanded="false">
+      <span>Activity log</span><span class="log-last" id="log-last"></span><span class="chev" aria-hidden="true">▴</span>
+    </button>
+    <div class="log-body" id="log-body" hidden>
+      <div class="log-tools"><button class="btn btn-ghost btn-sm" id="log-copy" type="button">Copy</button></div>
+      <pre id="log"></pre>
+    </div>
+  </footer>
+</body>
+</html>

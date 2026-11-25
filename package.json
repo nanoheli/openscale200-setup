@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/unit.test.mjs",
+    "test:sitl": "node test/sitl-cli.test.mjs"
+  }
+}
