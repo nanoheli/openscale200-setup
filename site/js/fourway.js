@@ -147,11 +147,21 @@ export class FourWayClient {
   }
 
   // Connects to ESC `index`'s bootloader. Returns { signature, bootPin, mode }.
-  async initFlash(index) {
-    // The FC probes the bootloader before answering; this takes about a second.
-    const r = await this.request(FW_CMD.DeviceInitFlash, 0, [index], { timeoutMs: 3000, retries: 3 });
-    const [lo, hi, pin, mode] = r.params;
-    return { signature: (hi << 8) | lo, flashCode: hi, bootPin: pin, mode };
+  // A running AM32 app only resets into its bootloader after the signal line has
+  // been held high for 0.5-2 s, so keep trying (with pauses) until `waitMs` is up.
+  async initFlash(index, { waitMs = 10000, retryDelayMs = 500 } = {}) {
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      try {
+        // The FC probes the bootloader before answering; this takes about a second.
+        const r = await this.request(FW_CMD.DeviceInitFlash, 0, [index], { timeoutMs: 3000 });
+        const [lo, hi, pin, mode] = r.params;
+        return { signature: (hi << 8) | lo, flashCode: hi, bootPin: pin, mode };
+      } catch (err) {
+        if (err.ack === 0x08 || Date.now() + retryDelayMs >= deadline) throw err; // 0x08: no such ESC
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+      }
+    }
   }
 
   async read(address, count) {

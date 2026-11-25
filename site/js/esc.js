@@ -160,7 +160,8 @@ export class Am32Updater {
     const old = describeEeprom(oldEeprom);
     this.log(`${name}: bootloader v${oldEeprom[2]}, pin 0x${dev.bootPin.toString(16)}, ` +
       (old.valid ? `AM32 ${old.firmware} "${oldTag}", EEPROM layout v${old.eepromVersion}` : "no valid AM32 EEPROM"));
-    if (oldTag && /^[\x20-\x7e]+$/.test(oldTag) && oldTag !== tag) {
+    const accepted = this.firmware.acceptTags ?? [tag];
+    if (oldTag && /^[\x20-\x7e]+$/.test(oldTag) && !accepted.includes(oldTag)) {
       throw new Error(`${name} runs firmware for "${oldTag}", but the update is for "${tag}". Not flashing a different ESC target.`);
     }
     const total = image.length * 2 + 2 * AM32.eepromSize;

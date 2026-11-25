@@ -240,6 +240,7 @@ class FakeAm32Esc {
     for (let i = t.length; i < 32; i++) this.flash[0x7be0 + i] = 0;
     if (oldEeprom) this.flash.set(oldEeprom, 0x7c00);
     this.failWriteAt = null; // address whose first write fails
+    this.notReady = 0; // InitFlash attempts that fail before the bootloader is up
   }
   write(addr, data) {
     if (addr < 0x1000 || (addr & 3) || (data.length & 3)) return false;
@@ -280,6 +281,10 @@ function fake4WayFc(escs) {
         return fwReply(cmd, addr, [...new TextEncoder().encode("m4wFCIntf")], 0);
       case 0x37:
         if (params[0] >= escs.length) return fwReply(cmd, addr, [0], 0x08);
+        if (escs[params[0]].notReady > 0) {
+          escs[params[0]].notReady--;
+          return fwReply(cmd, 0, [0, 0, 0, 0], 0x0f);
+        }
         selected = params[0];
         return fwReply(cmd, 0, [0x06, 0x1f, 0x22, 4], 0);
       case 0x3a: {
@@ -401,7 +406,7 @@ await test("ESC update: flash, init, configure both ESCs via 4-way", async () =>
   // Old factory EEPROM (layout v1, AM32 2.10) with unrelated settings.
   const old = new Uint8Array(192).fill(0x33);
   old.set([1, 1, 12, 2, 10], 0);
-  const escs = [new FakeAm32Esc({ oldEeprom: old }), new FakeAm32Esc({ blVersion: 9 })];
+  const escs = [new FakeAm32Esc({ tag: "GSK_3S_F421", oldEeprom: old }), new FakeAm32Esc({ blVersion: 9 })];
   escs[0].flash.fill(0x00, 0x1000, 0x7000); // old firmware
   const { sim, reply, results } = await runUpdate(escs, [mainFile, tailFile]);
   assert.deepEqual(Array.from(reply), [2]);
@@ -412,6 +417,16 @@ await test("ESC update: flash, init, configure both ESCs via 4-way", async () =>
   assert.equal(results[0].after.firmware, "2.19");
   assert.deepEqual(sim.st.resets, [0, 1]);
   assert.ok(sim.st.exited, "left 4-way mode");
+});
+
+await test("ESC update: waits until the ESC's bootloader answers", async () => {
+  const escs = [new FakeAm32Esc(), new FakeAm32Esc()];
+  escs[0].notReady = 3;
+  escs[1].notReady = 2;
+  const { results } = await runUpdate(escs, [mainFile, tailFile]);
+  results.forEach((r) => assert.ok(!(r instanceof Error), r?.stack));
+  expectFlashed(escs[0], mainFile);
+  expectFlashed(escs[1], tailFile);
 });
 
 await test("ESC update: a failed page write is retried from the page start", async () => {
@@ -456,6 +471,14 @@ await test("CLI script preparation", async () => {
   assert.ok(!lines.some((l) => l.startsWith("#") || l === "save" || l.startsWith("mcu_id") || l.startsWith("signature")));
   assert.ok(lines.includes("board_name GOOSKY_F4MINI"));
   assert.ok(lines.includes("set name = Bo105_Zi"));
+  // Lines the F405 build rejected on the real heli are not sent.
+  const kept = prepareCliScript(await readFile(site(SETUP.cliDump), "utf8"), SETUP.cliSkip);
+  for (const bad of ["resource PPM 1 NONE", "resource PWM 8 NONE", "beacon -RX_LOST", "beacon -RX_SET",
+    "set input_filtering_mode = OFF", "set beeper_dshot_beacon_tone = 1", "set usb_hid_cdc = OFF"]) {
+    assert.ok(lines.includes(bad), bad);
+    assert.ok(!kept.includes(bad), bad);
+  }
+  assert.equal(lines.length - kept.length, 14);
 });
 
 await test("MSP frame encoding", () => {

@@ -278,7 +278,7 @@ async function loadSetupFiles() {
   data.escFiles = await Promise.all(
     SETUP.escs.map(async (esc) => new Uint8Array(await (await fetchOk(esc.file)).arrayBuffer())),
   );
-  data.cliLines = prepareCliScript(await (await fetchOk(SETUP.cliDump)).text());
+  data.cliLines = prepareCliScript(await (await fetchOk(SETUP.cliDump)).text(), SETUP.cliSkip);
   $("cli-count").textContent = String(data.cliLines.length);
   renderEscCards();
 }
@@ -437,6 +437,9 @@ $("esc-run").addEventListener("click", async () => {
       );
     }
     log(`4-way interface: ${await fw.interfaceName()}`);
+    // The ESCs only reset into their bootloaders once the signal has been gone for a moment.
+    log("Waiting for the ESCs to switch to their bootloaders");
+    await sleep(2500);
 
     const updater = new Am32Updater(fw, escFirmware, log);
     for (const [i, esc] of SETUP.escs.entries()) {

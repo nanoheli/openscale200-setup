@@ -32,6 +32,9 @@ export const SETUP = {
   escFirmware: {
     hex: "firmware/AM32_GOOSKY_3S_F421_2.19.hex",
     tag: "GOOSKY_3S_F421",
+    // Firmware names (tag at 0x7BE0) an ESC may already carry and still be updated.
+    // GSK_3S_F421 is GOOSKY's factory AM32 2.16 build for the same ESC.
+    acceptTags: ["GOOSKY_3S_F421", "GSK_3S_F421"],
     fwMajor: 2,
     fwMinor: 19,
     eepromVersion: 3, // EEPROM layout of AM32 2.19 (same as the .ecf files)
@@ -43,4 +46,14 @@ export const SETUP = {
   ],
 
   cliDump: "config/RTFL_cli_Bo105_Zi_20261125_213215.txt",
+  // Lines from the dump that the STM32F405 build of 2a0a8d1 does not have (the
+  // features are compiled out). The FC rejects them, which would block the save,
+  // and they configure nothing on this board, so they are not sent.
+  cliSkip: [
+    /^resource (PPM|PWM) \d+ NONE$/,
+    /^beacon /,
+    /^set input_filtering_mode = /,
+    /^set beeper_dshot_beacon_tone = /,
+    /^set usb_hid_cdc = /,
+  ],
 };

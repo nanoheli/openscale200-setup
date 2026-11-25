@@ -5,13 +5,14 @@ const decoder = new TextDecoder();
 
 // Lines from a `dump all` that must not be replayed: comments, the read-only
 // MCU id, the per-board signature and the trailing save (sent separately).
-export function prepareCliScript(text) {
+export function prepareCliScript(text, skip = []) {
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter((l) => l.length > 0 && !l.startsWith("#"))
     .filter((l) => !/^(mcu_id|signature)(\s|$)/.test(l))
-    .filter((l) => l !== "save");
+    .filter((l) => l !== "save")
+    .filter((l) => !skip.some((re) => re.test(l)));
   // Start from a clean, known state regardless of what was on the FC before.
   return ["defaults nosave", ...lines];
 }

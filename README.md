@@ -14,13 +14,16 @@ WebSerial and WebUSB, so it needs **Chrome or Edge on a desktop computer**.
    config is embedded as custom defaults, the same way the Rotorflight Configurator does
    it. The whole chip is erased, then written, then read back to verify.
 3. **Settings**: replays `RTFL_cli_Bo105_Zi_20261125_213215.txt` in the CLI, starting with
-   `defaults nosave`, then saves. If the FC rejects any line, nothing is saved until the
+   `defaults nosave`, then saves. Lines for features the F405 build doesn't have
+   (`cliSkip` in `setup-data.js`) are left out. If the FC rejects any line, nothing is saved until the
    user chooses **Save anyway** or **Discard**. Before sending anything, the board name
    is checked over MSP, because a mismatching `board_name` halts the FC.
 4. **ESCs**: switches the FC into 4-way passthrough (`MSP_SET_PASSTHROUGH`) and, for
    motor 1 (main) and motor 2 (tail):
    1. checks that the ESC reports an AM32 ARM bootloader with the 32 KB layout and
-      that the firmware tag it carries (0x7BE0) is `GOOSKY_3S_F421`;
+      that the firmware tag it carries (0x7BE0) is `GOOSKY_3S_F421` or GOOSKY's factory
+      `GSK_3S_F421`. It first waits for the ESCs to reset into their bootloaders, which
+      AM32 does 0.5-2 s after the signal stops;
    2. blanks the EEPROM (so an interrupted update leaves the ESC in its bootloader);
    3. flashes `AM32_GOOSKY_3S_F421_2.19.hex` (0x1000-0x7BFF, page by page) and reads it back;
    4. initialises the EEPROM: boot byte 0x01, layout v3, firmware 2.19, tune and CAN area blank;
