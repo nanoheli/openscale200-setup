@@ -1,10 +1,11 @@
 import { SETUP } from "./setup-data.js";
 import { SerialTransport, serialSupported } from "./serial.js";
-import { MspClient, MSP, REBOOT, apiAtLeast } from "./msp.js";
+import { MspClient, MSP, REBOOT } from "./msp.js";
 import { CliSession, prepareCliScript } from "./cli.js";
 import { DfuDevice, usbSupported } from "./dfu.js";
 import { parseHex, insertConfig, buildCustomDefaults } from "./hex.js";
-import { EscProgrammer, summarizeSettings } from "./esc.js";
+import { FourWayClient } from "./fourway.js";
+import { Am32Updater, buildFirmwareImage, summarizeSettings } from "./esc.js";
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -49,27 +50,25 @@ function downloadLog() {
 // ---------------------------------------------------------------------------
 // wizard state & navigation
 // ---------------------------------------------------------------------------
-const STEPS = ["welcome", "power", "escs", "firmware", "settings", "done"];
-const TASKS = ["power", "escs", "firmware", "settings"];
+const STEPS = ["welcome", "power", "firmware", "settings", "escs", "done"];
+const TASKS = ["power", "firmware", "settings", "escs"];
 const STATUS_TEXT = { pending: "", done: "Done", skipped: "Skipped", error: "Needs attention" };
 
 const state = {
   current: "welcome",
-  status: { power: "pending", escs: "pending", firmware: "pending", settings: "pending" },
-  escDeferred: false,
+  status: { power: "pending", firmware: "pending", settings: "pending", escs: "pending" },
   busy: false,
 };
 
 try {
-  const saved = JSON.parse(sessionStorage.getItem("os200-setup") || "null");
+  const saved = JSON.parse(sessionStorage.getItem("os200-setup-v2") || "null");
   if (saved?.status) Object.assign(state.status, saved.status);
-  if (saved?.escDeferred) state.escDeferred = true;
 } catch {
   /* ignore */
 }
 
 function persist() {
-  sessionStorage.setItem("os200-setup", JSON.stringify({ status: state.status, escDeferred: state.escDeferred }));
+  sessionStorage.setItem("os200-setup-v2", JSON.stringify({ status: state.status }));
 }
 
 function setStatus(task, value) {
@@ -117,11 +116,8 @@ function goTo(step) {
 }
 
 function nextAfter(step) {
-  const order = ["power", "escs", "firmware", "settings"];
-  if (step === "settings" && state.escDeferred && state.status.escs !== "done") return "escs";
-  if (step === "escs" && state.escDeferred && state.status.settings === "done") return "done";
-  const i = order.indexOf(step);
-  return i >= 0 && i < order.length - 1 ? order[i + 1] : "done";
+  const i = TASKS.indexOf(step);
+  return i >= 0 && i < TASKS.length - 1 ? TASKS[i + 1] : "done";
 }
 
 function setBusy(busy) {
@@ -270,7 +266,7 @@ function checkBoard(info, { forCli = false } = {}) {
 // ---------------------------------------------------------------------------
 // data files
 // ---------------------------------------------------------------------------
-const data = { escFiles: [], cliLines: null, firmware: null };
+const data = { escFiles: [], cliLines: null, firmware: null, escFirmware: null };
 
 async function fetchOk(path) {
   const res = await fetch(path, { cache: "no-cache" });
@@ -306,6 +302,16 @@ async function loadFirmware() {
   return structuredClone(hex);
 }
 
+async function loadEscFirmware() {
+  if (data.escFirmware) return data.escFirmware;
+  const cfg = SETUP.escFirmware;
+  const { image, tag } = buildFirmwareImage(parseHex(await (await fetchOk(cfg.hex)).text()));
+  if (tag !== cfg.tag) throw new Error(`ESC firmware file is for "${tag}", expected "${cfg.tag}".`);
+  data.escFirmware = { ...cfg, image, tag };
+  log(`ESC firmware ready: AM32 ${cfg.fwMajor}.${cfg.fwMinor} "${tag}", ${image.length} bytes`);
+  return data.escFirmware;
+}
+
 // ---------------------------------------------------------------------------
 // bindings
 // ---------------------------------------------------------------------------
@@ -314,6 +320,7 @@ const BIND = {
   fwCommit: SETUP.firmware.commit,
   cliFile: SETUP.cliDump.split("/").pop(),
   craftName: SETUP.craftName,
+  escFw: `${SETUP.escFirmware.fwMajor}.${SETUP.escFirmware.fwMinor}`,
 };
 document.querySelectorAll("[data-bind]").forEach((el) => (el.textContent = BIND[el.dataset.bind] ?? ""));
 document.querySelectorAll("[data-bind-href]").forEach((el) => (el.href = SETUP.firmware.commitUrl));
@@ -352,7 +359,7 @@ $("power-next").disabled = !$("power-confirm").checked;
 $("power-confirm").addEventListener("change", (e) => ($("power-next").disabled = !e.target.checked));
 $("power-next").addEventListener("click", () => {
   setStatus("power", "done");
-  goTo("escs");
+  goTo(nextAfter("power"));
 });
 
 // ---------------------------------------------------------------------------
@@ -361,6 +368,7 @@ $("power-next").addEventListener("click", () => {
 function renderEscCards() {
   const grid = $("esc-grid");
   grid.textContent = "";
+  const fwText = `AM32 ${SETUP.escFirmware.fwMajor}.${SETUP.escFirmware.fwMinor} · ${SETUP.escFirmware.tag}`;
   SETUP.escs.forEach((esc, i) => {
     const card = document.createElement("div");
     card.className = "esc-card";
@@ -368,11 +376,14 @@ function renderEscCards() {
     card.dataset.state = "idle";
     card.innerHTML = `
       <div class="esc-head"><h3></h3><span class="esc-motor"></span></div>
-      <div class="esc-status"><span class="esc-status-text">Ready</span></div>
+      <div class="esc-fw"></div>
+      <div class="esc-status"><span>Ready</span></div>
+      <div class="bar esc-bar"><div class="bar-fill"></div></div>
       <dl class="esc-settings"></dl>
       <div class="esc-file"></div>`;
     card.querySelector("h3").textContent = esc.role;
     card.querySelector(".esc-motor").textContent = `Motor ${esc.motor}`;
+    card.querySelector(".esc-fw").textContent = fwText;
     card.querySelector(".esc-file").textContent = esc.file.split("/").pop();
     const dl = card.querySelector(".esc-settings");
     for (const [k, v] of summarizeSettings(data.escFiles[i])) {
@@ -386,7 +397,7 @@ function renderEscCards() {
   });
 }
 
-function setEscCard(i, cardState, text) {
+function setEscCard(i, cardState, text, fraction) {
   const card = $(`esc-card-${i}`);
   card.dataset.state = cardState;
   const status = card.querySelector(".esc-status");
@@ -399,29 +410,44 @@ function setEscCard(i, cardState, text) {
   const t = document.createElement("span");
   t.textContent = (cardState === "done" ? "✓ " : cardState === "error" ? "✕ " : "") + text;
   status.appendChild(t);
+  if (fraction !== undefined) card.querySelector(".esc-bar .bar-fill").style.width = `${Math.round(fraction * 100)}%`;
 }
 
 $("esc-run").addEventListener("click", async () => {
-  hide("esc-error", "esc-old-fw");
+  hide("esc-error");
   setBusy(true);
   $("esc-run").disabled = true;
   let ok = true;
-  let programmer = null;
+  let fw = null;
   try {
-    const info = await ensureConnected();
-    if (!apiAtLeast(info.apiVersion, SETUP.firmware.minEscApi)) {
-      log(`MSP API ${info.apiString} has no ESC forward programming`, "warn");
-      show("esc-old-fw");
-      return;
+    const escFirmware = await loadEscFirmware();
+    await ensureConnected();
+
+    // Switch the USB port from MSP to the 4-way interface.
+    log("Entering ESC passthrough (4-way interface)");
+    const reply = await fc.msp.request(MSP.SET_PASSTHROUGH, [], { timeoutMs: 3000, retries: 0 });
+    fc.msp.dispose();
+    fc.msp = null;
+    fw = new FourWayClient(fc.transport);
+    const escCount = reply[0] ?? 0;
+    log(`Flight controller reports ${escCount} ESC(s)`);
+    if (escCount < SETUP.escs.length) {
+      throw new Error(
+        `The flight controller only found ${escCount} ESC(s). Apply the settings first (they enable both motors), then try again.`,
+      );
     }
-    programmer = new EscProgrammer(fc.msp, log);
+    log(`4-way interface: ${await fw.interfaceName()}`);
+
+    const updater = new Am32Updater(fw, escFirmware, log);
     for (const [i, esc] of SETUP.escs.entries()) {
-      setEscCard(i, "busy", "Connecting…");
+      setEscCard(i, "busy", "Connecting…", 0);
       try {
-        const res = await programmer.program(esc.index, data.escFiles[i], {
-          onStatus: (s) => setEscCard(i, "busy", s),
+        const res = await updater.update(esc.index, data.escFiles[i], {
+          onStatus: (_phase, text) => setEscCard(i, "busy", text),
+          onProgress: (f) => setEscCard(i, "busy", $(`esc-card-${i}`).querySelector(".esc-status").textContent, f),
         });
-        setEscCard(i, "done", res.changed ? `Configured (AM32 ${res.esc.firmware})` : `Already configured (AM32 ${res.esc.firmware})`);
+        await fw.reset(esc.index).catch(() => {});
+        setEscCard(i, "done", `AM32 ${res.after.firmware} installed, settings applied`, 1);
       } catch (err) {
         ok = false;
         setEscCard(i, "error", err.message);
@@ -430,17 +456,22 @@ $("esc-run").addEventListener("click", async () => {
     }
   } catch (err) {
     ok = false;
-    show("esc-error", ["Could not configure the ESCs.", err.message]);
+    show("esc-error", ["Could not update the ESCs.", err.message]);
     log(err.message, "error");
   } finally {
-    if (programmer) {
-      log("Leaving ESC programming mode (the ESCs restart)");
-      await programmer.deselect();
+    if (fw) {
+      log("Leaving ESC passthrough (the ESCs restart)");
+      await fw.exit().catch((e) => log(`4-way exit: ${e.message}`, "warn"));
+      fw.dispose();
+      if (fc.transport) {
+        fc.msp = new MspClient(fc.transport);
+        await sleep(500);
+        await identify().catch((e) => log(`Flight controller did not answer after passthrough: ${e.message}`, "warn"));
+      }
     }
     setBusy(false);
     $("esc-run").disabled = false;
   }
-  if (!$("esc-old-fw").hidden) return;
   if (ok) {
     setStatus("escs", "done");
     $("esc-run").hidden = true;
@@ -449,16 +480,14 @@ $("esc-run").addEventListener("click", async () => {
     setStatus("escs", "error");
     $("esc-run").textContent = "Try again";
     if ($("esc-error").hidden) {
-      show("esc-error", ["One or both ESCs could not be configured.", "Check the battery and the ESC signal wires, then try again."]);
+      show("esc-error", [
+        "One or both ESCs were not updated.",
+        "Check that the battery is connected and the ESC signal wires are plugged in, then try again. An ESC that failed stays in its bootloader until it is updated successfully.",
+      ]);
     }
   }
 });
 
-$("esc-defer").addEventListener("click", () => {
-  state.escDeferred = true;
-  persist();
-  goTo("firmware");
-});
 $("esc-next").addEventListener("click", () => goTo(nextAfter("escs")));
 $("esc-skip").addEventListener("click", () => {
   if (state.status.escs !== "done") setStatus("escs", "skipped");
@@ -715,7 +744,7 @@ $("cli-skip").addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 const TASK_LABEL = {
   power: "Battery connected",
-  escs: "ESCs configured (main + tail)",
+  escs: `ESCs updated to AM32 ${SETUP.escFirmware.fwMajor}.${SETUP.escFirmware.fwMinor} and configured`,
   firmware: `Rotorflight ${SETUP.firmware.version} (${SETUP.firmware.commit}) installed`,
   settings: `Settings "${SETUP.craftName}" applied`,
 };
@@ -724,7 +753,6 @@ const SUMMARY_TEXT = { done: "Done", skipped: "Skipped", error: "Not finished", 
 $("done-log").addEventListener("click", downloadLog);
 $("done-restart").addEventListener("click", () => {
   Object.keys(state.status).forEach((k) => (state.status[k] = "pending"));
-  state.escDeferred = false;
   persist();
   location.reload();
 });

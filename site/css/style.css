@@ -179,6 +179,8 @@ main { padding: 36px 48px 120px; max-width: 860px; width: 100%; }
 .esc-settings { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; font-size: 13px; margin: 0; }
 .esc-settings dt { color: var(--n-400); }
 .esc-settings dd { margin: 0; font-variant-numeric: tabular-nums; }
+.esc-fw { font-size: 13px; color: var(--accent-text); margin: -4px 0 8px; font-weight: 600; }
+.esc-bar { height: 6px; margin-bottom: 12px; }
 .esc-file { font-size: 12px; color: var(--n-500); margin-top: 10px; font-family: var(--mono); }
 .spinner { width: 14px; height: 14px; border: 2px solid var(--n-600); border-top-color: var(--accent-text); border-radius: 50%; animation: spin 0.8s linear infinite; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }

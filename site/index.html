@@ -40,9 +40,9 @@
 
         <ol class="overview">
           <li><span class="ov-icon">⚡</span><div><strong>Power up</strong><span>Connect the flight battery and USB.</span></div></li>
-          <li><span class="ov-icon">⚙</span><div><strong>Configure the ESCs</strong><span>Main motor (1) and tail motor (2) get their AM32 settings.</span></div></li>
           <li><span class="ov-icon">⬆</span><div><strong>Update Rotorflight</strong><span>Install Rotorflight <span data-bind="fwVersion"></span> (master <code data-bind="fwCommit"></code>).</span></div></li>
           <li><span class="ov-icon">✓</span><div><strong>Apply the settings</strong><span>Load the tested OpenScale 200 configuration.</span></div></li>
+          <li><span class="ov-icon">⚙</span><div><strong>Update the ESCs</strong><span>AM32 <span data-bind="escFw"></span> plus settings for the main (1) and tail (2) motor.</span></div></li>
         </ol>
 
         <div class="card">
@@ -69,11 +69,11 @@
       <section class="step" data-step="power" data-title="Power up">
         <p class="eyebrow">Step 1 of 4</p>
         <h1>Power the helicopter with the battery</h1>
-        <p class="lead">The ESCs only respond when the flight battery is connected. USB power alone isn't enough.</p>
+        <p class="lead">The ESCs are updated at the end and only respond when the flight battery is connected. USB power alone isn't enough.</p>
 
         <div class="notice notice-warn">
           <strong>Safety first: remove the main and tail rotor blades.</strong>
-          <span>Motors can twitch while the ESCs are being programmed.</span>
+          <span>Motors can twitch while the ESCs are being updated.</span>
         </div>
 
         <ol class="instructions">
@@ -92,31 +92,9 @@
         </div>
       </section>
 
-      <!-- Step: escs -->
-      <section class="step" data-step="escs" data-title="ESCs">
-        <p class="eyebrow">Step 2 of 4</p>
-        <h1>Configure the ESCs</h1>
-        <p class="lead">Both AM32 ESCs are programmed through the flight controller. Keep the battery connected.</p>
-
-        <div class="esc-grid" id="esc-grid"></div>
-
-        <div class="notice notice-info" id="esc-old-fw" hidden>
-          <strong>The firmware on this flight controller is too old to program ESCs.</strong>
-          <span>Update the firmware and apply the settings first. The assistant brings you back here afterwards.</span>
-          <div class="actions-inline"><button class="btn btn-secondary btn-sm" id="esc-defer" type="button">Update firmware first</button></div>
-        </div>
-        <div class="notice notice-error" id="esc-error" hidden></div>
-
-        <div class="actions">
-          <button class="btn btn-primary" id="esc-run" type="button">Configure ESCs</button>
-          <button class="btn btn-primary" id="esc-next" type="button" hidden>Continue</button>
-          <button class="btn btn-link" id="esc-skip" type="button">Skip this step</button>
-        </div>
-      </section>
-
       <!-- Step: firmware -->
       <section class="step" data-step="firmware" data-title="Firmware">
-        <p class="eyebrow">Step 3 of 4</p>
+        <p class="eyebrow">Step 2 of 4</p>
         <h1>Update Rotorflight</h1>
         <p class="lead">Installs Rotorflight <strong data-bind="fwVersion"></strong> from master <a data-bind-href="fwCommitUrl" target="_blank" rel="noopener"><code data-bind="fwCommit"></code></a> for the <strong>GOOSKY F4 Mini</strong> flight controller.</p>
 
@@ -166,7 +144,7 @@
 
       <!-- Step: settings -->
       <section class="step" data-step="settings" data-title="Settings">
-        <p class="eyebrow">Step 4 of 4</p>
+        <p class="eyebrow">Step 3 of 4</p>
         <h1>Apply the helicopter settings</h1>
         <p class="lead">Loads the tested configuration <code data-bind="cliFile"></code>: receiver, swashplate, servos, governor, rates and PID tuning.</p>
 
@@ -199,6 +177,28 @@
           <button class="btn btn-primary" id="cli-run" type="button">Apply settings</button>
           <button class="btn btn-primary" id="cli-next" type="button" hidden>Continue</button>
           <button class="btn btn-link" id="cli-skip" type="button">Skip this step</button>
+        </div>
+      </section>
+
+      <!-- Step: escs -->
+      <section class="step" data-step="escs" data-title="ESCs">
+        <p class="eyebrow">Step 4 of 4</p>
+        <h1>Update the ESCs</h1>
+        <p class="lead">Both ESCs get AM32 <strong data-bind="escFw"></strong> through the flight controller. Their memory is then initialised and the settings are applied. This takes about two minutes.</p>
+
+        <div class="notice notice-warn">
+          <strong>Keep the battery and USB connected until both ESCs are done.</strong>
+          <span>If the update is interrupted, the ESC stays in its bootloader and the update can simply be run again.</span>
+        </div>
+
+        <div class="esc-grid" id="esc-grid"></div>
+
+        <div class="notice notice-error" id="esc-error" hidden></div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="esc-run" type="button">Update ESCs</button>
+          <button class="btn btn-primary" id="esc-next" type="button" hidden>Continue</button>
+          <button class="btn btn-link" id="esc-skip" type="button">Skip this step</button>
         </div>
       </section>
 

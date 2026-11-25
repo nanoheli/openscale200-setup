@@ -1,54 +1,89 @@
-// AM32 ESC configuration through Rotorflight's MSP forward-programming bridge
-// (MSP_SET_4WIF_ESC_FWD_PROG + MSP_ESC_PARAMETERS / MSP_SET_ESC_PARAMETERS).
-// Same handshake and timings as the Configurator's ESC programming tab
-// (src/tabs/esc_programming, manufacturers/am32.js).
+// AM32 ESC update over the flight controller's 4-way passthrough:
+//   1. blank the EEPROM (boot byte cleared, so an interrupted flash leaves the
+//      ESC safely in its bootloader)
+//   2. flash the AM32 firmware image and read it back
+//   3. init the EEPROM: boot byte 0x01, layout version, firmware version,
+//      tune and CAN area blank (0xFF)
+//   4. apply the .ecf settings (48 bytes) and read everything back
 //
-// MSP_ESC_PARAMETERS returns a 2-byte header [signature, version|flags]
-// followed by the ESC's raw 48-byte AM32 EEPROM, which is exactly the format
-// of an AM32 configurator .ecf file.
+// Memory map of a 32 KB AM32 part (F051/F421 class, bootloader signature 0x1F06):
+//   0x0000-0x0FFF bootloader | 0x1000-0x7BFF firmware (tag at 0x7BE0) | 0x7C00 EEPROM
+// The AM32 bootloader erases a 1 KB page whenever a write starts on a page
+// boundary, so the firmware is written page by page, in order, 256 bytes at a time.
 
-import { MSP } from "./msp.js";
+import { IF_MODE_ARM } from "./fourway.js";
 
-export const AM32_SIGNATURE = 0xc2;
-export const AM32_EEPROM_BYTES = 48;
-const HEADER_RDONLY = 0x40;
-const DESELECT = 100;
-
-// EEPROM bytes that describe the ESC itself rather than settings. These are
-// kept as the ESC reports them; only the settings are taken from the file.
-const IDENTITY = { start: 0, eepromVersion: 1, bootloader: 2, fwMajor: 3, fwMinor: 4 };
-const IDENTITY_BYTES = 5;
-
-const TIMING = {
-  preSwitchDelayMs: 800,
-  switchReadDelayMs: 4000,
-  pollIntervalMs: 600,
-  detectTimeoutMs: 20000,
-  switchRetries: 3,
-  postSaveSettleMs: 1000,
-  postSaveReturnMs: 1000,
+export const AM32 = {
+  flashBase: 0x08000000,
+  firmwareStart: 0x1000,
+  eepromStart: 0x7c00,
+  tagAddress: 0x7be0,
+  tagLength: 32,
+  pageSize: 0x400,
+  chunk: 0x100,
+  eepromSize: 192, // sizeof(EEprom_t): 48 settings + 128 tune + 16 CAN
+  settingsSize: 48,
+  flashCode32k: 0x1f,
 };
 
-const sleep = (ms, signal) =>
-  new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(t);
-      reject(new DOMException("Aborted", "AbortError"));
-    });
-  });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const tagString = (bytes) => {
+  const end = bytes.findIndex((b) => b === 0 || b === 0xff);
+  return String.fromCharCode(...bytes.slice(0, end < 0 ? bytes.length : end));
+};
+
+// Contiguous image from firmwareStart up to the EEPROM, gaps filled with 0xFF.
+export function buildFirmwareImage(hex) {
+  const start = AM32.flashBase + AM32.firmwareStart;
+  const end = AM32.flashBase + AM32.eepromStart;
+  const image = new Uint8Array(end - start).fill(0xff);
+  for (const block of hex.data) {
+    if (block.address < start || block.address + block.bytes > end) {
+      throw new Error(
+        `ESC firmware writes outside the application area (0x${block.address.toString(16)}). ` +
+          "It is not an AM32 image for a 32 KB ESC.",
+      );
+    }
+    image.set(block.data, block.address - start);
+  }
+  const tag = tagString(Array.from(image.slice(AM32.tagAddress - AM32.firmwareStart, AM32.tagAddress - AM32.firmwareStart + AM32.tagLength)));
+  return { image, tag };
+}
+
+// Byte 2 (bootloader version) is replaced by the bootloader on every EEPROM
+// write, so it is never compared.
+const EEPROM_BOOTLOADER_BYTE = 2;
+
+export function buildInitEeprom({ eepromVersion, fwMajor, fwMinor, bootloaderVersion = 0 }) {
+  const e = new Uint8Array(AM32.eepromSize).fill(0xff);
+  e.set([0x01, eepromVersion, bootloaderVersion, fwMajor, fwMinor], 0);
+  return e;
+}
+
+export function buildConfigEeprom(init, ecf) {
+  if (ecf.length !== AM32.settingsSize) throw new Error(`ESC config must be ${AM32.settingsSize} bytes`);
+  const e = Uint8Array.from(init);
+  e.set(ecf.slice(5), 5); // settings only; identity bytes 0-4 come from the init image
+  return e;
+}
+
+export function sameExceptBootloaderByte(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (i !== EEPROM_BOOTLOADER_BYTE && a[i] !== b[i]) return false;
+  return true;
+}
 
 export function describeEeprom(bytes) {
   return {
-    eepromVersion: bytes[IDENTITY.eepromVersion],
-    bootloader: bytes[IDENTITY.bootloader],
-    firmware: `${bytes[IDENTITY.fwMajor]}.${String(bytes[IDENTITY.fwMinor]).padStart(2, "0")}`,
+    valid: bytes[0] === 0x01,
+    eepromVersion: bytes[1],
+    bootloader: bytes[2],
+    firmware: `${bytes[3]}.${String(bytes[4]).padStart(2, "0")}`,
   };
 }
 
-// Human-readable summary of the main settings in an AM32 EEPROM image
-// (same field positions as the Configurator's AM32 definition).
+// Human-readable summary of the main settings in an AM32 EEPROM image.
 export function summarizeSettings(b) {
   // AM32 >= 2.18 stores timing as 10 + degrees / 0.9375; older files use 0-3 (x 7.5°).
   const timing = b[23] >= 10 ? `${((b[23] - 10) * 0.9375).toFixed(1)}°` : `${b[23] * 7.5}°`;
@@ -65,120 +100,119 @@ export function summarizeSettings(b) {
   ];
 }
 
-export function buildWritePayload(current, file) {
-  const eeprom = Uint8Array.from(file);
-  for (let i = 0; i < IDENTITY_BYTES; i++) eeprom[i] = current[i];
-  return Uint8Array.from([AM32_SIGNATURE, 0x00, ...eeprom]);
-}
-
-export class EscProgrammer {
-  constructor(msp, log = () => {}, timing = {}) {
-    this.msp = msp;
+export class Am32Updater {
+  // fw: FourWayClient; firmware: { image, tag, eepromVersion, fwMajor, fwMinor }
+  constructor(fw, firmware, log = () => {}) {
+    this.fw = fw;
+    this.firmware = firmware;
     this.log = log;
-    this.t = { ...TIMING, ...timing };
   }
 
-  async selectTarget(target) {
-    // The FC blocks ~2.5 s entering the bootloader bridge before it answers.
-    await this.msp.request(MSP.SET_4WIF_ESC_FWD_PROG, [target & 0xff], { timeoutMs: 8000, retries: 1 });
-  }
-
-  async deselect() {
-    try {
-      await this.selectTarget(DESELECT);
-    } catch {
-      /* best effort */
+  async readBlock(address, length) {
+    const out = new Uint8Array(length);
+    for (let off = 0; off < length; off += AM32.chunk) {
+      const n = Math.min(AM32.chunk, length - off);
+      out.set(await this.fw.read(address + off, n), off);
     }
+    return out;
   }
 
-  async readOnce() {
-    try {
-      const resp = await this.msp.request(MSP.ESC_PARAMETERS, [], { timeoutMs: 3000, retries: 0 });
-      return resp;
-    } catch {
-      return null;
-    }
+  async writeEeprom(bytes) {
+    // 192 bytes starting on the page boundary: the bootloader erases the page first.
+    await this.fw.write(AM32.eepromStart, bytes);
+    return this.readBlock(AM32.eepromStart, AM32.eepromSize);
   }
 
-  async poll(signal) {
-    const deadline = Date.now() + this.t.detectTimeoutMs;
-    while (Date.now() < deadline) {
-      const resp = await this.readOnce();
-      if (resp && resp.length >= 2 + AM32_EEPROM_BYTES && resp[0] === AM32_SIGNATURE) return resp;
-      if (resp && resp.length >= 2 && resp[0] !== 0 && resp[0] !== AM32_SIGNATURE) {
-        throw new Error(`This ESC is not running AM32 (signature 0x${resp[0].toString(16)}).`);
+  // Writes one 1 KB page (first chunk erases it). Retried as a whole page.
+  async writePage(pageOffset, attempts = 3) {
+    const { image } = this.firmware;
+    let lastErr;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        for (let off = pageOffset; off < pageOffset + AM32.pageSize && off < image.length; off += AM32.chunk) {
+          await this.fw.write(AM32.firmwareStart + off, image.subarray(off, off + AM32.chunk));
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        this.log(`Page 0x${(AM32.firmwareStart + pageOffset).toString(16)}: ${err.message}, retrying`);
+        await sleep(100);
       }
-      await sleep(this.t.pollIntervalMs, signal);
     }
-    return null;
+    throw lastErr;
   }
 
-  // Selects an ESC and returns its 50-byte parameter block.
-  async connect(index, signal) {
-    for (let attempt = 0; attempt <= this.t.switchRetries; attempt++) {
-      await this.selectTarget(DESELECT).catch(() => {});
-      await sleep(this.t.preSwitchDelayMs, signal);
-      await this.selectTarget(index);
-      await sleep(this.t.switchReadDelayMs, signal);
-      const resp = await this.poll(signal);
-      if (resp) return resp;
-      this.log(`ESC ${index + 1}: no answer, retrying (${attempt + 1}/${this.t.switchRetries})`);
-    }
-    throw new Error(
-      "The ESC did not answer. Check that the flight battery is connected and the ESC signal wire is plugged in.",
-    );
-  }
+  // onStatus(phase, text), onProgress(fraction 0..1 over the whole job)
+  async update(index, ecf, { onStatus = () => {}, onProgress = () => {} } = {}) {
+    const { image, tag } = this.firmware;
+    const name = `ESC ${index + 1}`;
 
-  // Writes `file` (48-byte .ecf) to ESC `index` and verifies it.
-  // onStatus(text) reports progress; returns { before, after, changed }.
-  async program(index, file, { onStatus = () => {}, signal } = {}) {
-    if (file.length !== AM32_EEPROM_BYTES) throw new Error(`Config file must be ${AM32_EEPROM_BYTES} bytes.`);
-
-    onStatus("Connecting to ESC…");
-    const current = await this.connect(index, signal);
-    if (current[1] & HEADER_RDONLY) throw new Error("The flight controller is armed. Disarm and try again.");
-    const before = current.slice(2, 2 + AM32_EEPROM_BYTES);
-    const esc = describeEeprom(before);
-    const wanted = describeEeprom(file);
-    this.log(`ESC ${index + 1}: AM32 ${esc.firmware}, EEPROM layout v${esc.eepromVersion}, bootloader v${esc.bootloader}`);
-
-    if (esc.eepromVersion !== wanted.eepromVersion) {
+    onStatus("connect", "Connecting to the ESC bootloader…");
+    const dev = await this.fw.initFlash(index);
+    if (dev.mode !== IF_MODE_ARM || dev.flashCode !== AM32.flashCode32k) {
       throw new Error(
-        `This ESC uses AM32 settings layout v${esc.eepromVersion}, but the setup file was made for v${wanted.eepromVersion} ` +
-          `(AM32 ${wanted.firmware}). Update the ESC firmware first.`,
+        `Unexpected ESC (bootloader signature 0x${dev.signature.toString(16)}, mode ${dev.mode}). ` +
+          "This update is only for the OpenScale 200's AM32 ESCs.",
       );
     }
-    if (esc.firmware !== wanted.firmware) {
-      this.log(`ESC ${index + 1}: note: file was saved from AM32 ${wanted.firmware}, ESC runs ${esc.firmware}`);
+    const oldEeprom = await this.readBlock(AM32.eepromStart, AM32.eepromSize);
+    const oldTag = tagString(Array.from(await this.fw.read(AM32.tagAddress, AM32.tagLength)));
+    const old = describeEeprom(oldEeprom);
+    this.log(`${name}: bootloader v${oldEeprom[2]}, pin 0x${dev.bootPin.toString(16)}, ` +
+      (old.valid ? `AM32 ${old.firmware} "${oldTag}", EEPROM layout v${old.eepromVersion}` : "no valid AM32 EEPROM"));
+    if (oldTag && /^[\x20-\x7e]+$/.test(oldTag) && oldTag !== tag) {
+      throw new Error(`${name} runs firmware for "${oldTag}", but the update is for "${tag}". Not flashing a different ESC target.`);
     }
+    const total = image.length * 2 + 2 * AM32.eepromSize;
+    let done = 0;
+    const step = (n) => onProgress((done += n) / total);
 
-    const payload = buildWritePayload(before, file);
-    const expected = payload.slice(2);
-    const changed = expected.some((v, i) => v !== before[i]);
-    if (!changed) {
-      onStatus("Already configured");
-      this.log(`ESC ${index + 1}: settings already match, nothing to write`);
-      return { before, after: before, changed: false, esc };
+    // 1. blank EEPROM: the bootloader no longer jumps to a half-written app
+    onStatus("flash", "Clearing settings…");
+    const blank = new Uint8Array(AM32.eepromSize).fill(0xff);
+    const cleared = await this.writeEeprom(blank);
+    if (!sameExceptBootloaderByte(cleared, blank)) throw new Error(`${name}: could not clear the EEPROM`);
+    // The bootloader stamps its own version into byte 2 of every EEPROM write.
+    const bootloaderVersion = cleared[EEPROM_BOOTLOADER_BYTE];
+
+    // 2. firmware
+    onStatus("flash", `Flashing AM32 ${this.firmware.fwMajor}.${this.firmware.fwMinor}…`);
+    for (let page = 0; page < image.length; page += AM32.pageSize) {
+      await this.writePage(page);
+      step(Math.min(AM32.pageSize, image.length - page));
     }
-
-    onStatus("Writing settings…");
-    await this.msp.request(MSP.SET_ESC_PARAMETERS, Array.from(payload), { timeoutMs: 8000, retries: 0 });
-
-    // The bridge is left in an undefined state after an EEPROM write: deselect
-    // (which also flushes the pending write to the ESC), then select again.
-    onStatus("Verifying…");
-    await sleep(this.t.postSaveSettleMs, signal);
-    await this.selectTarget(DESELECT).catch(() => {});
-    await sleep(this.t.postSaveReturnMs, signal);
-    const reread = await this.connect(index, signal);
-    const after = reread.slice(2, 2 + AM32_EEPROM_BYTES);
-    const mismatch = [];
-    for (let i = IDENTITY_BYTES; i < AM32_EEPROM_BYTES; i++) if (after[i] !== expected[i]) mismatch.push(i);
-    if (mismatch.length) {
-      throw new Error(`The ESC did not keep ${mismatch.length} setting byte(s) (offsets ${mismatch.join(", ")}).`);
+    onStatus("verify", "Verifying firmware…");
+    for (let off = 0; off < image.length; off += AM32.chunk) {
+      const n = Math.min(AM32.chunk, image.length - off);
+      const back = await this.fw.read(AM32.firmwareStart + off, n);
+      for (let i = 0; i < n; i++) {
+        if (back[i] !== image[off + i]) {
+          throw new Error(`${name}: firmware verification failed at 0x${(AM32.firmwareStart + off + i).toString(16)}`);
+        }
+      }
+      step(n);
     }
-    onStatus("Done");
-    this.log(`ESC ${index + 1}: settings written and verified`);
-    return { before, after, changed: true, esc };
+    this.log(`${name}: firmware written and verified (${image.length} bytes)`);
+
+    try {
+      // 3. init memory
+      onStatus("init", "Initialising memory…");
+      const init = buildInitEeprom({ ...this.firmware, bootloaderVersion });
+      if (!sameExceptBootloaderByte(await this.writeEeprom(init), init)) throw new Error(`${name}: EEPROM init did not verify`);
+      step(AM32.eepromSize);
+
+      // 4. settings
+      onStatus("config", "Applying settings…");
+      const config = buildConfigEeprom(init, ecf);
+      const after = await this.writeEeprom(config);
+      if (!sameExceptBootloaderByte(after, config)) throw new Error(`${name}: settings did not verify`);
+      step(AM32.eepromSize);
+      this.log(`${name}: EEPROM initialised and settings applied`);
+      return { before: old, after: describeEeprom(after), oldTag };
+    } catch (err) {
+      // Never leave the ESC able to start with half-written settings.
+      await this.fw.write(AM32.eepromStart, blank).catch(() => {});
+      throw err;
+    }
   }
 }

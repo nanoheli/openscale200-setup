@@ -2,7 +2,7 @@
 //  - HEX parsing + custom-defaults insertion match rotorflight-configurator byte for byte
 //    (set CONFIGURATOR_DIR to a rotorflight-configurator checkout to enable)
 //  - DFU flasher against a simulated STM32 DfuSe bootloader
-//  - AM32 ESC programming against a simulated Rotorflight 4-way bridge
+//  - AM32 ESC flash + EEPROM init + config against a simulated 4-way interface and AM32 bootloader
 //  - CLI script preparation
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -13,7 +13,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseHex, insertConfig, buildCustomDefaults } from "../site/js/hex.js";
 import { DfuDevice, parseFlashDescriptor } from "../site/js/dfu.js";
 import { MspClient, MSP } from "../site/js/msp.js";
-import { EscProgrammer, buildWritePayload, summarizeSettings } from "../site/js/esc.js";
+import { Am32Updater, buildFirmwareImage, summarizeSettings } from "../site/js/esc.js";
+import { FourWayClient, crc16xmodem } from "../site/js/fourway.js";
 import { prepareCliScript } from "../site/js/cli.js";
 import { SETUP } from "../site/js/setup-data.js";
 
@@ -228,84 +229,131 @@ await test("DFU: verify catches a bad write", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Simulated Rotorflight FC with two AM32 ESCs behind the 4-way bridge
-// (behaviour of sensors/esc_sensor.c at 2a0a8d1).
-function fakeFc(escs) {
-  const dataListeners = new Set();
-  const st = { selected: 100, programming: false, readsSinceSelect: 0, pending: null, writes: 0 };
-  const send = (code, payload, error = false) => {
-    const size = payload.length;
-    const frame = [0x24, 0x4d, error ? 0x21 : 0x3e, size, code, ...payload];
-    let ck = size ^ code;
+// Simulated FC 4-way interface (io/serial_4way.c) with AM32 F421 bootloaders
+// (AM32-bootloader main.c + Mcu/f421 save_flash_nolib) behind it.
+class FakeAm32Esc {
+  constructor({ tag = "GOOSKY_3S_F421", oldEeprom = null, blVersion = 12 } = {}) {
+    this.flash = new Uint8Array(0x8000).fill(0xff);
+    this.blVersion = blVersion;
+    const t = new TextEncoder().encode(tag);
+    this.flash.set(t, 0x7be0);
+    for (let i = t.length; i < 32; i++) this.flash[0x7be0 + i] = 0;
+    if (oldEeprom) this.flash.set(oldEeprom, 0x7c00);
+    this.failWriteAt = null; // address whose first write fails
+  }
+  write(addr, data) {
+    if (addr < 0x1000 || (addr & 3) || (data.length & 3)) return false;
+    if (this.failWriteAt === addr) {
+      this.failWriteAt = null;
+      return false;
+    }
+    const buf = Uint8Array.from(data);
+    if (addr === 0x7c00 && buf.length > 2) buf[2] = this.blVersion;
+    if (addr % 0x400 === 0) this.flash.fill(0xff, addr, addr + 0x400); // page erase
+    for (let i = 0; i < buf.length; i++) this.flash[addr + i] &= buf[i];
+    for (let i = 0; i < buf.length; i++) if (this.flash[addr + i] !== buf[i]) return false;
+    return true;
+  }
+}
+
+function fake4WayFc(escs) {
+  const listeners = new Set();
+  const st = { mode: "msp", resets: [], exited: false };
+  const rx = [];
+  const emit = (bytes) => setTimeout(() => listeners.forEach((fn) => fn(Uint8Array.from(bytes))), 1);
+  const mspReply = (code, payload) => {
+    let ck = payload.length ^ code;
     for (const b of payload) ck ^= b;
-    frame.push(ck);
-    setTimeout(() => dataListeners.forEach((fn) => fn(Uint8Array.from(frame))), 1);
+    emit([0x24, 0x4d, 0x3e, payload.length, code, ...payload, ck]);
   };
-  const flush = () => {
-    if (st.pending) {
-      escs[st.pending.id].set(st.pending.data);
-      st.writes++;
-      st.pending = null;
-    }
+  const fwReply = (cmd, addr, params, ack) => {
+    const p = params.length ? params : [0];
+    const f = [0x2e, cmd, addr >> 8, addr & 0xff, p.length === 256 ? 0 : p.length, ...p, ack];
+    const crc = crc16xmodem(f);
+    emit([...f, crc >> 8, crc & 0xff]);
   };
-  const handle = (code, payload) => {
-    switch (code) {
-      case MSP.SET_4WIF_ESC_FWD_PROG: {
-        flush();
-        const id = payload[0];
-        if (id >= 4) {
-          st.selected = 100;
-          st.programming = false;
-        } else {
-          st.selected = id;
-          st.programming = true;
-          st.readsSinceSelect = 0;
-        }
-        return send(code, []);
+  let selected = -1;
+  const handle4 = (cmd, addr, params) => {
+    const esc = escs[selected];
+    switch (cmd) {
+      case 0x32:
+        return fwReply(cmd, addr, [...new TextEncoder().encode("m4wFCIntf")], 0);
+      case 0x37:
+        if (params[0] >= escs.length) return fwReply(cmd, addr, [0], 0x08);
+        selected = params[0];
+        return fwReply(cmd, 0, [0x06, 0x1f, 0x22, 4], 0);
+      case 0x3a: {
+        const n = params[0] === 0 ? 256 : params[0];
+        return fwReply(cmd, addr, Array.from(esc.flash.slice(addr, addr + n)), 0);
       }
-      case MSP.ESC_PARAMETERS: {
-        if (st.selected >= 4) return send(code, [], true);
-        if (st.readsSinceSelect++ === 0) return send(code, [], true); // first fetch fails
-        return send(code, [0xc2, 0x00, ...escs[st.selected]]);
-      }
-      case MSP.SET_ESC_PARAMETERS: {
-        if (st.selected >= 4 || payload.length !== 50 || payload[0] !== 0xc2 || payload[1] !== 0) return send(code, [], true);
-        st.pending = { id: st.selected, data: payload.slice(2) };
-        return send(code, []);
-      }
+      case 0x3b:
+        return fwReply(cmd, addr, [0], esc.write(addr, params) ? 0 : 0x0f);
+      case 0x35:
+        st.resets.push(params[0]);
+        return fwReply(cmd, addr, [0], 0);
+      case 0x34:
+        st.mode = "msp";
+        st.exited = true;
+        return fwReply(cmd, addr, [0], 0);
       default:
-        return send(code, [], true);
+        return fwReply(cmd, addr, [0], 0x02);
     }
   };
-  let buf = [];
   return {
     st,
     transport: {
-      onData(fn) { dataListeners.add(fn); return () => dataListeners.delete(fn); },
-      onClose() { return () => {}; },
-      async write(bytes) {
-        buf.push(...bytes);
-        while (buf.length >= 6) {
-          const size = buf[3];
-          if (buf.length < 6 + size) break;
-          const frame = buf.splice(0, 6 + size);
-          handle(frame[4], frame.slice(5, 5 + size));
-        }
+      onData(fn) {
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+      },
+      onClose() {
+        return () => {};
       },
       async close() {},
+      async write(bytes) {
+        rx.push(...bytes);
+        for (;;) {
+          if (st.mode === "msp") {
+            const i = rx.indexOf(0x24);
+            if (i < 0 || rx.length < i + 6) return;
+            rx.splice(0, i);
+            const size = rx[3];
+            if (rx.length < 6 + size) return;
+            const f = rx.splice(0, 6 + size);
+            if (f[4] === MSP.SET_PASSTHROUGH) {
+              mspReply(f[4], [escs.length]);
+              st.mode = "4way";
+            } else mspReply(f[4], []);
+          } else {
+            const i = rx.indexOf(0x2f);
+            if (i < 0 || rx.length < i + 5) return;
+            rx.splice(0, i);
+            const len = rx[4] === 0 ? 256 : rx[4];
+            if (rx.length < 5 + len + 2) return;
+            const f = rx.splice(0, 5 + len + 2);
+            const crc = crc16xmodem(f.slice(0, 5 + len));
+            if (((f[5 + len] << 8) | f[6 + len]) !== crc) {
+              fwReply(f[1], 0, [0], 0x03);
+              continue;
+            }
+            handle4(f[1], (f[2] << 8) | f[3], f.slice(5, 5 + len));
+          }
+        }
+      },
     },
   };
 }
 
-const FAST = { preSwitchDelayMs: 1, switchReadDelayMs: 1, pollIntervalMs: 5, detectTimeoutMs: 500, postSaveSettleMs: 1, postSaveReturnMs: 1 };
 const mainFile = new Uint8Array(await readFile(site(SETUP.escs[0].file)));
 const tailFile = new Uint8Array(await readFile(site(SETUP.escs[1].file)));
+const escHex = parseHex(await readFile(site(SETUP.escFirmware.hex), "utf8"));
+const escFw = { ...SETUP.escFirmware, ...buildFirmwareImage(escHex) };
 
-await test(".ecf files are AM32 EEPROM v3 images", () => {
+await test(".ecf files are AM32 2.19 / EEPROM v3 images", () => {
+  const f0 = SETUP.escFirmware;
   for (const f of [mainFile, tailFile]) {
     assert.equal(f.length, 48);
-    assert.equal(f[0], 1);
-    assert.equal(f[1], 3);
+    assert.deepEqual([f[0], f[1], f[3], f[4]], [1, f0.eepromVersion, f0.fwMajor, f0.fwMinor]);
   }
   const main = Object.fromEntries(summarizeSettings(mainFile));
   assert.equal(main["Motor KV"], 500);
@@ -313,51 +361,91 @@ await test(".ecf files are AM32 EEPROM v3 images", () => {
   assert.equal(main.Timing, "15.0°");
 });
 
-await test("ESC: both ESCs programmed, identity bytes preserved, verified", async () => {
-  // ESCs currently hold other settings and a newer AM32 build (2.20).
-  const esc0 = Uint8Array.from(tailFile); esc0[3] = 2; esc0[4] = 20; esc0[2] = 5;
-  const esc1 = Uint8Array.from(mainFile); esc1[4] = 20;
-  const sim = fakeFc([esc0, esc1, new Uint8Array(48), new Uint8Array(48)]);
-  const msp = new MspClient(sim.transport);
-  const prog = new EscProgrammer(msp, () => {}, FAST);
-  const r0 = await prog.program(0, mainFile);
-  const r1 = await prog.program(1, tailFile);
-  await prog.deselect();
-  assert.ok(r0.changed && r1.changed);
-  assert.equal(sim.st.writes, 2);
-  assert.deepEqual(Array.from(esc0.slice(5)), Array.from(mainFile.slice(5)));
-  assert.deepEqual(Array.from(esc1.slice(5)), Array.from(tailFile.slice(5)));
-  assert.deepEqual(Array.from(esc0.slice(0, 5)), [1, 3, 5, 2, 20], "ESC identity kept");
-  assert.equal(sim.st.selected, 100, "bridge deselected at the end");
-  msp.dispose();
+await test("ESC firmware image: AM32 app area only, tag matches", () => {
+  assert.equal(escFw.tag, SETUP.escFirmware.tag);
+  assert.equal(escFw.image.length, 0x7c00 - 0x1000);
+  assert.equal(escFw.image.length % 0x400, 0);
 });
 
-await test("ESC: nothing written when settings already match", async () => {
-  const esc0 = Uint8Array.from(mainFile);
-  const sim = fakeFc([esc0, new Uint8Array(48), new Uint8Array(48), new Uint8Array(48)]);
+async function runUpdate(escs, files) {
+  const sim = fake4WayFc(escs);
   const msp = new MspClient(sim.transport);
-  const r = await new EscProgrammer(msp, () => {}, FAST).program(0, mainFile);
-  assert.equal(r.changed, false);
-  assert.equal(sim.st.writes, 0);
+  const reply = await msp.request(MSP.SET_PASSTHROUGH);
   msp.dispose();
+  const fw = new FourWayClient(sim.transport);
+  assert.equal(await fw.interfaceName(), "m4wFCIntf");
+  const updater = new Am32Updater(fw, escFw, () => {});
+  const results = [];
+  try {
+    for (let i = 0; i < files.length; i++) {
+      results.push(await updater.update(i, files[i]).then((r) => r, (e) => e));
+      await fw.reset(i);
+    }
+  } finally {
+    await fw.exit();
+    fw.dispose();
+  }
+  return { sim, reply, results };
+}
+
+function expectFlashed(esc, ecf) {
+  const app = esc.flash.slice(0x1000, 0x7c00);
+  assert.ok(Buffer.from(app).equals(Buffer.from(escFw.image)), "firmware matches image");
+  const e = esc.flash.slice(0x7c00, 0x7c00 + 192);
+  assert.deepEqual(Array.from(e.slice(0, 5)), [1, 3, esc.blVersion, 2, 19], "identity bytes");
+  assert.deepEqual(Array.from(e.slice(5, 48)), Array.from(ecf.slice(5)), "settings from .ecf");
+  assert.ok(e.slice(48).every((b) => b === 0xff), "tune + CAN blank");
+}
+
+await test("ESC update: flash, init, configure both ESCs via 4-way", async () => {
+  // Old factory EEPROM (layout v1, AM32 2.10) with unrelated settings.
+  const old = new Uint8Array(192).fill(0x33);
+  old.set([1, 1, 12, 2, 10], 0);
+  const escs = [new FakeAm32Esc({ oldEeprom: old }), new FakeAm32Esc({ blVersion: 9 })];
+  escs[0].flash.fill(0x00, 0x1000, 0x7000); // old firmware
+  const { sim, reply, results } = await runUpdate(escs, [mainFile, tailFile]);
+  assert.deepEqual(Array.from(reply), [2]);
+  results.forEach((r) => assert.ok(!(r instanceof Error), r?.stack));
+  expectFlashed(escs[0], mainFile);
+  expectFlashed(escs[1], tailFile);
+  assert.equal(results[0].before.firmware, "2.10");
+  assert.equal(results[0].after.firmware, "2.19");
+  assert.deepEqual(sim.st.resets, [0, 1]);
+  assert.ok(sim.st.exited, "left 4-way mode");
 });
 
-await test("ESC: refuses a different EEPROM layout", async () => {
-  const esc0 = Uint8Array.from(mainFile); esc0[1] = 2;
-  const sim = fakeFc([esc0, new Uint8Array(48), new Uint8Array(48), new Uint8Array(48)]);
-  const msp = new MspClient(sim.transport);
-  await assert.rejects(new EscProgrammer(msp, () => {}, FAST).program(0, mainFile), /layout v2/);
-  assert.equal(sim.st.writes, 0);
-  msp.dispose();
+await test("ESC update: a failed page write is retried from the page start", async () => {
+  const escs = [new FakeAm32Esc()];
+  escs[0].failWriteAt = 0x1100; // second chunk of the first page
+  const { results } = await runUpdate(escs, [mainFile]);
+  assert.ok(!(results[0] instanceof Error), results[0]?.stack);
+  expectFlashed(escs[0], mainFile);
 });
 
-await test("ESC: write payload is header + file with ESC identity", () => {
-  const current = Uint8Array.from(mainFile); current[4] = 99;
-  const p = buildWritePayload(current, tailFile);
-  assert.equal(p.length, 50);
-  assert.deepEqual(Array.from(p.slice(0, 2)), [0xc2, 0x00]);
-  assert.equal(p[2 + 4], 99);
-  assert.deepEqual(Array.from(p.slice(7)), Array.from(tailFile.slice(5)));
+await test("ESC update: refuses an ESC with a different AM32 target", async () => {
+  const escs = [new FakeAm32Esc({ tag: "OTHER_ESC_G071" })];
+  const before = Uint8Array.from(escs[0].flash);
+  const { results } = await runUpdate(escs, [mainFile]);
+  assert.ok(results[0] instanceof Error && /OTHER_ESC_G071/.test(results[0].message));
+  assert.ok(Buffer.from(escs[0].flash).equals(Buffer.from(before)), "nothing written");
+});
+
+await test("ESC update: settings failure leaves the ESC in its bootloader", async () => {
+  const escs = [new FakeAm32Esc()];
+  const esc = escs[0];
+  const realWrite = esc.write.bind(esc);
+  let eepromWrites = 0;
+  // EEPROM writes: 1 = blank, 2 = init, 3 = settings (fails)
+  esc.write = (addr, data) => (addr === 0x7c00 && ++eepromWrites === 3 ? false : realWrite(addr, data));
+  const { results } = await runUpdate(escs, [mainFile]);
+  assert.ok(results[0] instanceof Error);
+  assert.notEqual(esc.flash[0x7c00], 0x01, "boot byte not set, ESC will not start");
+});
+
+await test("4-way frame encoding (CRC16-XMODEM)", () => {
+  const f = FourWayClient.encode(0x32, 0, []);
+  assert.deepEqual(Array.from(f.slice(0, 6)), [0x2f, 0x32, 0, 0, 1, 0]);
+  assert.equal(crc16xmodem([0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39]), 0x31c3);
 });
 
 // ---------------------------------------------------------------------------

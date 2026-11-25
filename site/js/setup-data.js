@@ -26,8 +26,15 @@ export const SETUP = {
       commitHash: "1d9cb4dc6f85c7895c2b089f4b8aa776ca3d3bd3",
       date: "2026-06-30T17:50:14+02:00",
     },
-    // MSP API version the ESC forward-programming path needs (MSP_SET_4WIF_ESC_FWD_PROG).
-    minEscApi: [12, 9],
+  },
+
+  // AM32 firmware flashed to both ESCs through the FC's 4-way passthrough.
+  escFirmware: {
+    hex: "firmware/AM32_GOOSKY_3S_F421_2.19.hex",
+    tag: "GOOSKY_3S_F421",
+    fwMajor: 2,
+    fwMinor: 19,
+    eepromVersion: 3, // EEPROM layout of AM32 2.19 (same as the .ecf files)
   },
 
   escs: [
